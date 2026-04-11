@@ -1,0 +1,35 @@
+name: palace
+version: "1.0.0"
+description: >
+  Memory Palace — hierarchical knowledge storage with FTS5 search,
+  temporal knowledge graph, and automatic memory extraction from
+  conversations, project files, and past sessions.
+
+features:
+  - Hierarchical storage (wings → rooms → drawers)
+  - Full-text search across all memories
+  - Temporal knowledge graph with entity tracking
+  - Automatic memory extraction from conversations
+  - Project file mining
+  - Session history mining
+  - Built-in memory mirroring
+
+config:
+  db_path:
+    default: "$HERMES_HOME/palace/drawers.db"
+    description: "SQLite database path for drawers"
+  kg_path:
+    default: "$HERMES_HOME/palace/knowledge_graph.db"
+    description: "SQLite database path for knowledge graph"
+  auto_extract:
+    default: true
+    description: "Auto-extract memories on each turn"
+  session_extract:
+    default: true
+    description: "Extract memories at session end"
+  min_confidence:
+    default: 0.3
+    description: "Minimum confidence for auto-extraction"
+  mirror_builtin:
+    default: true
+    description: "Mirror built-in memory writes to palace"
