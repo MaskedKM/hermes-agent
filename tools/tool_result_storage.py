@@ -119,6 +119,7 @@ def maybe_persist_tool_result(
     env=None,
     config: BudgetConfig = DEFAULT_BUDGET,
     threshold: int | float | None = None,
+    context_budget_chars: int | None = None,
 ) -> str:
     """Layer 2: persist oversized result into the sandbox, return preview + path.
 
@@ -133,11 +134,21 @@ def maybe_persist_tool_result(
         env: The active BaseEnvironment instance, or None.
         config: BudgetConfig controlling thresholds and preview size.
         threshold: Explicit override; takes precedence over config resolution.
+        context_budget_chars: Dynamic upper bound derived from remaining
+            context window. When set, the effective threshold is capped at
+            context_budget_chars * 0.15 so no single tool result can
+            dominate the available context.
 
     Returns:
         Original content if small, or <persisted-output> replacement.
     """
     effective_threshold = threshold if threshold is not None else config.resolve_threshold(tool_name)
+
+    # Dynamic cap: no single tool result should exceed 15% of remaining context.
+    if context_budget_chars is not None and effective_threshold != float("inf"):
+        dynamic_cap = int(context_budget_chars * 0.15)
+        if effective_threshold > dynamic_cap:
+            effective_threshold = dynamic_cap
 
     if effective_threshold == float("inf"):
         return content

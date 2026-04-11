@@ -6886,6 +6886,7 @@ class AIAgent:
                 tool_name=name,
                 tool_use_id=tc.id,
                 env=get_active_env(effective_task_id),
+                context_budget_chars=self._get_remaining_context_budget(messages),
             )
 
             subdir_hints = self._subdirectory_hints.check_tool_call(name, args)
@@ -7217,6 +7218,7 @@ class AIAgent:
                 tool_name=function_name,
                 tool_use_id=tool_call.id,
                 env=get_active_env(effective_task_id),
+                context_budget_chars=self._get_remaining_context_budget(messages),
             )
 
             # Discover subdirectory context files from tool arguments
@@ -7280,6 +7282,26 @@ class AIAgent:
                 remaining = self.max_iterations - api_call_count
                 tier = "⚠️  WARNING" if remaining <= self.max_iterations * 0.1 else "💡 CAUTION"
                 print(f"{self.log_prefix}{tier}: {remaining} iterations remaining")
+
+    def _get_remaining_context_budget(self, messages: list) -> int | None:
+        """Estimate remaining context budget in chars (tokens * 4).
+
+        Returns None if the context_compressor is not available or
+        context_length is not set, in which case the caller should
+        fall back to static thresholds.
+        """
+        try:
+            ctx_len = self.context_compressor.context_length
+            if not ctx_len or ctx_len <= 0:
+                return None
+            used_tokens = estimate_messages_tokens_rough(messages)
+            remaining_tokens = ctx_len - used_tokens
+            # Reserve 10% tail budget for the assistant response
+            tail_tokens = int(ctx_len * 0.10)
+            usable_tokens = max(remaining_tokens - tail_tokens, 0)
+            return usable_tokens * 4  # rough chars estimate
+        except Exception:
+            return None
 
     def _get_budget_warning(self, api_call_count: int) -> Optional[str]:
         """Return a budget pressure string, or None if not yet needed.
@@ -7811,7 +7833,9 @@ class AIAgent:
         if self._memory_manager:
             try:
                 _query = original_user_message if isinstance(original_user_message, str) else ""
-                _ext_prefetch_cache = self._memory_manager.prefetch_all(_query) or ""
+                _ext_prefetch_cache = self._memory_manager.prefetch_all(
+                    _query, session_id=self.session_id or ""
+                ) or ""
             except Exception:
                 pass
 
