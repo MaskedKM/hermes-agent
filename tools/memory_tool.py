@@ -33,6 +33,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Dict, Any, List, Optional
+from datetime import datetime, date, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +98,55 @@ def _scan_memory_content(content: str) -> Optional[str]:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Temporal metadata — @ts timestamps and @until expiry
+# ---------------------------------------------------------------------------
+
+_TS_PATTERN = re.compile(r'@ts=(\S+)')
+_UNTIL_PATTERN = re.compile(r'@until=(\S+)')
+
+
+def _strip_ts(content: str) -> str:
+    """Remove @ts= line from content for length checks."""
+    return _TS_PATTERN.sub('', content).rstrip()
+
+
+def _stamp_entry(content: str) -> str:
+    """Append or update @ts= timestamp."""
+    ts = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    stamped = _TS_PATTERN.sub(f'@ts={ts}', content)
+    if _TS_PATTERN.search(stamped):
+        return stamped
+    return f"{content}\n@ts={ts}"
+
+
+def _parse_ts(entry: str) -> Optional[datetime]:
+    m = _TS_PATTERN.search(entry)
+    if not m:
+        return None
+    try:
+        return datetime.fromisoformat(m.group(1).replace('Z', '+00:00'))
+    except ValueError:
+        return None
+
+
+def _parse_until(entry: str) -> Optional[date]:
+    m = _UNTIL_PATTERN.search(entry)
+    if not m:
+        return None
+    try:
+        return date.fromisoformat(m.group(1))
+    except ValueError:
+        return None
+
+
+def _is_expired(entry: str) -> bool:
+    until = _parse_until(entry)
+    if not until:
+        return False
+    return date.today() > until
+
+
 class MemoryStore:
     """
     Bounded curated memory with file persistence. One instance per AIAgent.
@@ -124,11 +174,17 @@ class MemoryStore:
         self.memory_entries = self._read_file(mem_dir / "MEMORY.md")
         self.user_entries = self._read_file(mem_dir / "USER.md")
 
-        # Deduplicate entries (preserves order, keeps first occurrence)
+        # 1. Auto-purge expired entries FIRST (before snapshot)
+        for target in ("memory", "user"):
+            purged = self.purge_expired(target)
+            if purged["archived_count"] > 0:
+                logger.info("Purged %d expired entries from %s", purged["archived_count"], target)
+
+        # 2. Deduplicate entries (preserves order, keeps first occurrence)
         self.memory_entries = list(dict.fromkeys(self.memory_entries))
         self.user_entries = list(dict.fromkeys(self.user_entries))
 
-        # Capture frozen snapshot for system prompt injection
+        # 3. Capture frozen snapshot for system prompt injection
         self._system_prompt_snapshot = {
             "memory": self._render_block("memory", self.memory_entries),
             "user": self._render_block("user", self.user_entries),
@@ -201,6 +257,8 @@ class MemoryStore:
         if not content:
             return {"success": False, "error": "Content cannot be empty."}
 
+        content = _stamp_entry(content)
+
         # Scan for injection/exfiltration before accepting
         scan_error = _scan_memory_content(content)
         if scan_error:
@@ -218,9 +276,10 @@ class MemoryStore:
                 return self._success_response(target, "Entry already exists (no duplicate added).")
 
             # Soft limit: warn if single entry exceeds 150 chars (but still allow it)
+            # @ts metadata is excluded from the count
             SOFT_ENTRY_LIMIT = 150
             warning = None
-            if len(content) > SOFT_ENTRY_LIMIT:
+            if len(_strip_ts(content)) > SOFT_ENTRY_LIMIT:
                 warning = (
                     f"Entry is {len(content)} chars (soft limit: {SOFT_ENTRY_LIMIT}). "
                     f"Consider condensing to key facts only."
@@ -277,6 +336,8 @@ class MemoryStore:
         scan_error = _scan_memory_content(new_content)
         if scan_error:
             return {"success": False, "error": scan_error}
+
+        new_content = _stamp_entry(new_content)
 
         with self._file_lock(self._path_for(target)):
             self._reload_target(target)
@@ -355,6 +416,37 @@ class MemoryStore:
             self.save_to_disk(target)
 
         return self._success_response(target, "Entry removed.")
+
+    def purge_expired(self, target: str) -> Dict[str, Any]:
+        """Move expired entries to ARCHIVE.md, return summary."""
+        with self._file_lock(self._path_for(target)):
+            self._reload_target(target)
+
+            entries = self._entries_for(target)
+            expired = [e for e in entries if _is_expired(e)]
+
+            if not expired:
+                return {"archived_count": 0, "freed_chars": 0}
+
+            active = [e for e in entries if not _is_expired(e)]
+            freed_chars = len(ENTRY_DELIMITER.join(expired))
+
+            self._set_entries(target, active)
+            self.save_to_disk(target)
+
+            # Append expired entries to ARCHIVE.md
+            archive_path = get_memory_dir() / "ARCHIVE.md"
+            archive_ts = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+            try:
+                with open(archive_path, "a", encoding="utf-8") as f:
+                    for entry in expired:
+                        f.write(f"\n--- Archived {archive_ts} ---\n")
+                        f.write(entry)
+                        f.write("\n")
+            except (OSError, IOError) as e:
+                logger.warning("Failed to write ARCHIVE.md: %s", e)
+
+        return {"archived_count": len(expired), "freed_chars": freed_chars}
 
     def format_for_system_prompt(self, target: str) -> Optional[str]:
         """
