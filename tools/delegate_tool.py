@@ -64,6 +64,7 @@ def _get_max_concurrent_children() -> int:
             pass
     return _DEFAULT_MAX_CONCURRENT_CHILDREN
 DEFAULT_MAX_ITERATIONS = 50
+DEFAULT_TIMEOUT = 600  # 10 minutes default timeout for sub-agents
 _HEARTBEAT_INTERVAL = 30  # seconds between parent activity heartbeats during delegation
 DEFAULT_TOOLSETS = ["terminal", "file", "web"]
 
@@ -606,12 +607,45 @@ def _run_single_child(
         except Exception:
             logger.debug("Failed to close child agent after delegation")
 
+
+def _handle_timeout(child, task_index: int, goal: str, elapsed: float) -> Dict[str, Any]:
+    """Handle a timed-out child agent: interrupt it and build a result dict."""
+    # Try to gracefully interrupt the child
+    try:
+        child.interrupt("Timeout exceeded in delegate_task")
+    except Exception as e:
+        logger.debug("Failed to interrupt timed-out child %d: %s", task_index, e)
+
+    # Extract any partial output the child produced before timeout
+    partial = ""
+    try:
+        messages = getattr(child, "conversation", []) or []
+        for msg in reversed(messages):
+            if isinstance(msg, dict) and msg.get("role") == "assistant":
+                content = msg.get("content", "")
+                if content and isinstance(content, str) and len(content) > 20:
+                    partial = content[:500]
+                    break
+    except Exception:
+        pass
+
+    return {
+        "task_index": task_index,
+        "status": "timed_out",
+        "summary": partial if partial else None,
+        "error": f"Subagent timed out after {elapsed:.0f}s",
+        "api_calls": 0,
+        "duration_seconds": round(elapsed, 2),
+    }
+
+
 def delegate_task(
     goal: Optional[str] = None,
     context: Optional[str] = None,
     toolsets: Optional[List[str]] = None,
     tasks: Optional[List[Dict[str, Any]]] = None,
     max_iterations: Optional[int] = None,
+    timeout: Optional[int] = None,
     acp_command: Optional[str] = None,
     acp_args: Optional[List[str]] = None,
     parent_agent=None,
@@ -642,6 +676,9 @@ def delegate_task(
     cfg = _load_config()
     default_max_iter = cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS)
     effective_max_iter = max_iterations or default_max_iter
+    effective_timeout = timeout if timeout is not None else cfg.get("default_timeout", DEFAULT_TIMEOUT)
+    if effective_timeout <= 0:
+        effective_timeout = None  # No timeout
 
     # Resolve delegation credentials (provider:model pair).
     # When delegation.provider is configured, this resolves the full credential
@@ -715,9 +752,30 @@ def delegate_task(
         _model_tools._last_resolved_tool_names = _parent_tool_names
 
     if n_tasks == 1:
-        # Single task -- run directly (no thread pool overhead)
+        # Single task -- run with timeout protection
         _i, _t, child = children[0]
-        result = _run_single_child(0, _t["goal"], child, parent_agent)
+        if effective_timeout is not None:
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(
+                    _run_single_child, 0, _t["goal"], child, parent_agent
+                )
+                try:
+                    result = future.result(timeout=effective_timeout)
+                except Exception as exc:
+                    elapsed = time.monotonic() - overall_start
+                    if isinstance(exc, TimeoutError) or "timed out" in str(exc).lower():
+                        result = _handle_timeout(child, 0, _t["goal"], elapsed)
+                    else:
+                        result = {
+                            "task_index": 0,
+                            "status": "error",
+                            "summary": None,
+                            "error": str(exc),
+                            "api_calls": 0,
+                            "duration_seconds": round(elapsed, 2),
+                        }
+        else:
+            result = _run_single_child(0, _t["goal"], child, parent_agent)
         results.append(result)
     else:
         # Batch -- run in parallel with per-task progress lines
@@ -726,6 +784,7 @@ def delegate_task(
 
         with ThreadPoolExecutor(max_workers=max_children) as executor:
             futures = {}
+            child_by_future = {}  # map future -> child agent for timeout handling
             for i, t, child in children:
                 future = executor.submit(
                     _run_single_child,
@@ -735,20 +794,30 @@ def delegate_task(
                     parent_agent=parent_agent,
                 )
                 futures[future] = i
+                child_by_future[future] = child
 
             for future in as_completed(futures):
+                idx = futures[future]
+                child_agent = child_by_future[future]
                 try:
-                    entry = future.result()
+                    if effective_timeout is not None:
+                        entry = future.result(timeout=effective_timeout)
+                    else:
+                        entry = future.result()
                 except Exception as exc:
-                    idx = futures[future]
-                    entry = {
-                        "task_index": idx,
-                        "status": "error",
-                        "summary": None,
-                        "error": str(exc),
-                        "api_calls": 0,
-                        "duration_seconds": 0,
-                    }
+                    elapsed = time.monotonic() - overall_start
+                    if isinstance(exc, TimeoutError) or "timed out" in str(exc).lower():
+                        goal_str = task_list[idx]["goal"] if idx < len(task_list) else ""
+                        entry = _handle_timeout(child_agent, idx, goal_str, elapsed)
+                    else:
+                        entry = {
+                            "task_index": idx,
+                            "status": "error",
+                            "summary": None,
+                            "error": str(exc),
+                            "api_calls": 0,
+                            "duration_seconds": round(elapsed, 2),
+                        }
                 results.append(entry)
                 completed_count += 1
 
@@ -1044,6 +1113,13 @@ DELEGATE_TASK_SCHEMA = {
                     "Only set lower for simple tasks."
                 ),
             },
+            "timeout": {
+                "type": "integer",
+                "description": (
+                    "Max seconds before a subagent is forcefully interrupted (default: 600). "
+                    "Set to 0 for no timeout. Timed-out subagents return partial output if available."
+                ),
+            },
             "acp_command": {
                 "type": "string",
                 "description": (
@@ -1080,6 +1156,7 @@ registry.register(
         toolsets=args.get("toolsets"),
         tasks=args.get("tasks"),
         max_iterations=args.get("max_iterations"),
+        timeout=args.get("timeout"),
         acp_command=args.get("acp_command"),
         acp_args=args.get("acp_args"),
         parent_agent=kw.get("parent_agent")),
