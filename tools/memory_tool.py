@@ -217,6 +217,15 @@ class MemoryStore:
             if content in entries:
                 return self._success_response(target, "Entry already exists (no duplicate added).")
 
+            # Soft limit: warn if single entry exceeds 150 chars (but still allow it)
+            SOFT_ENTRY_LIMIT = 150
+            warning = None
+            if len(content) > SOFT_ENTRY_LIMIT:
+                warning = (
+                    f"Entry is {len(content)} chars (soft limit: {SOFT_ENTRY_LIMIT}). "
+                    f"Consider condensing to key facts only."
+                )
+
             # Calculate what the new total would be
             new_entries = entries + [content]
             new_total = len(ENTRY_DELIMITER.join(new_entries))
@@ -234,11 +243,26 @@ class MemoryStore:
                     "usage": f"{current:,}/{limit:,}",
                 }
 
+            # Capacity warning at 80%
+            capacity_warning = None
+            if limit > 0:
+                pct = int((new_total / limit) * 100)
+                if pct >= 80:
+                    capacity_warning = (
+                        f"Memory will be at {pct}% capacity after this addition. "
+                        f"Consider consolidating or removing stale entries."
+                    )
+
             entries.append(content)
             self._set_entries(target, entries)
             self.save_to_disk(target)
 
-        return self._success_response(target, "Entry added.")
+        resp = self._success_response(target, "Entry added.")
+        if warning:
+            resp.setdefault("warnings", []).append(warning)
+        if capacity_warning:
+            resp.setdefault("warnings", []).append(capacity_warning)
+        return resp
 
     def replace(self, target: str, old_text: str, new_content: str) -> Dict[str, Any]:
         """Find entry containing old_text substring, replace it with new_content."""
@@ -492,6 +516,10 @@ MEMORY_SCHEMA = {
         "Save durable information to persistent memory that survives across sessions. "
         "Memory is injected into future turns, so keep it compact and focused on facts "
         "that will still matter later.\n\n"
+        "MEMORY TRIAD — three complementary persistence layers:\n"
+        "- Memory (this tool): compact key facts injected every turn\n"
+        "- Memory Palace (Palace): rich hierarchical knowledge store with FTS5 search\n"
+        "- Session Search: recall past conversations and task outcomes from transcripts\n\n"
         "WHEN TO SAVE (do this proactively, don't wait to be asked):\n"
         "- User corrects you or says 'remember this' / 'don't do that again'\n"
         "- User shares a preference, habit, or personal detail (name, role, timezone, coding style)\n"

@@ -66,6 +66,7 @@ from hermes_constants import get_hermes_home
 
 ILINK_BASE_URL = "https://ilinkai.weixin.qq.com"
 WEIXIN_CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c"
+WEIXIN_CDN_PROXY = os.environ.get("WEIXIN_CDN_PROXY", "")  # e.g. socks5://host:port
 ILINK_APP_ID = "bot"
 CHANNEL_VERSION = "2.2.0"
 ILINK_APP_CLIENT_VERSION = (2 << 16) | (2 << 8) | 0
@@ -1016,6 +1017,9 @@ class WeixinAdapter(BasePlatformAdapter):
         self._cdn_base_url = str(
             extra.get("cdn_base_url") or os.getenv("WEIXIN_CDN_BASE_URL", WEIXIN_CDN_BASE_URL)
         ).strip().rstrip("/")
+        self._cdn_proxy = str(
+            extra.get("cdn_proxy") or os.getenv("WEIXIN_CDN_PROXY", WEIXIN_CDN_PROXY)
+        ).strip()
         self._dm_policy = str(extra.get("dm_policy") or os.getenv("WEIXIN_DM_POLICY", "open")).strip().lower()
         self._group_policy = str(extra.get("group_policy") or os.getenv("WEIXIN_GROUP_POLICY", "disabled")).strip().lower()
         allow_from = extra.get("allow_from")
@@ -1088,6 +1092,17 @@ class WeixinAdapter(BasePlatformAdapter):
             logger.debug("[%s] Token lock unavailable (non-fatal): %s", self.name, exc)
 
         self._session = aiohttp.ClientSession()
+        self._cdn_session: Optional[aiohttp.ClientSession] = None
+        if self._cdn_proxy:
+            try:
+                from aiohttp_socks import ProxyConnector
+                connector = ProxyConnector.from_url(self._cdn_proxy, rdns=True)
+                self._cdn_session = aiohttp.ClientSession(connector=connector)
+                logger.info("[%s] CDN proxy enabled: %s (rdns=True)", self.name, self._cdn_proxy)
+            except ImportError:
+                logger.warning("[%s] WEIXIN_CDN_PROXY set but aiohttp-socks not installed", self.name)
+            except Exception as exc:
+                logger.warning("[%s] Failed to create CDN proxy session: %s", self.name, exc)
         self._token_store.restore(self._account_id)
         self._poll_task = asyncio.create_task(self._poll_loop(), name="weixin-poll")
         self._mark_connected()
@@ -1106,6 +1121,9 @@ class WeixinAdapter(BasePlatformAdapter):
         if self._session and not self._session.closed:
             await self._session.close()
         self._session = None
+        if self._cdn_session and not self._cdn_session.closed:
+            await self._cdn_session.close()
+        self._cdn_session = None
         if self._token_lock_identity:
             try:
                 from gateway.status import release_scoped_lock
@@ -1278,11 +1296,17 @@ class WeixinAdapter(BasePlatformAdapter):
                 media_paths.append(voice_path)
                 media_types.append("audio/silk")
 
+    def _get_session_for_cdn(self) -> aiohttp.ClientSession:
+        """Return the CDN session (proxied) or fall back to the default session."""
+        if self._cdn_session and not self._cdn_session.closed:
+            return self._cdn_session
+        return self._session  # type: ignore[return-value]
+
     async def _download_image(self, item: Dict[str, Any]) -> Optional[str]:
         media = _media_reference(item, "image_item")
         try:
             data = await _download_and_decrypt_media(
-                self._session,
+                self._get_session_for_cdn(),
                 cdn_base_url=self._cdn_base_url,
                 encrypted_query_param=media.get("encrypt_query_param"),
                 aes_key_b64=(item.get("image_item") or {}).get("aeskey")
@@ -1300,7 +1324,7 @@ class WeixinAdapter(BasePlatformAdapter):
         media = _media_reference(item, "video_item")
         try:
             data = await _download_and_decrypt_media(
-                self._session,
+                self._get_session_for_cdn(),
                 cdn_base_url=self._cdn_base_url,
                 encrypted_query_param=media.get("encrypt_query_param"),
                 aes_key_b64=media.get("aes_key"),
@@ -1319,7 +1343,7 @@ class WeixinAdapter(BasePlatformAdapter):
         mime = _mime_from_filename(filename)
         try:
             data = await _download_and_decrypt_media(
-                self._session,
+                self._get_session_for_cdn(),
                 cdn_base_url=self._cdn_base_url,
                 encrypted_query_param=media.get("encrypt_query_param"),
                 aes_key_b64=media.get("aes_key"),
@@ -1338,7 +1362,7 @@ class WeixinAdapter(BasePlatformAdapter):
             return None
         try:
             data = await _download_and_decrypt_media(
-                self._session,
+                self._get_session_for_cdn(),
                 cdn_base_url=self._cdn_base_url,
                 encrypted_query_param=media.get("encrypt_query_param"),
                 aes_key_b64=media.get("aes_key"),
@@ -1530,9 +1554,20 @@ class WeixinAdapter(BasePlatformAdapter):
         upload_param = str(upload_response.get("upload_param") or "")
         upload_full_url = str(upload_response.get("upload_full_url") or "")
         ciphertext = _aes128_ecb_encrypt(plaintext, aes_key)
+        print(f"[DEBUG] upload keys={list(upload_response.keys())} param={bool(upload_param)} full_url={bool(upload_full_url)}", flush=True)
+        # For upload_full_url path, extract encrypted_query_param from URL
+        # so we use it as-is for sendMessage (CDN x-encrypted-param header
+        # is a different value that causes "image expired" on client)
+        url_encrypted_query_param = ""
+        if upload_full_url:
+            from urllib.parse import urlparse, parse_qs
+            _parsed = urlparse(upload_full_url)
+            url_encrypted_query_param = parse_qs(_parsed.query).get(
+                "encrypted_query_param", [""]
+            )[0]
         if upload_param:
             encrypted_query_param = await _upload_ciphertext(
-                self._session,
+                self._get_session_for_cdn(),
                 ciphertext=ciphertext,
                 cdn_base_url=self._cdn_base_url,
                 upload_param=upload_param,
@@ -1540,21 +1575,22 @@ class WeixinAdapter(BasePlatformAdapter):
             )
         elif upload_full_url:
             timeout = aiohttp.ClientTimeout(total=120)
-            async with self._session.put(
+            async with self._get_session_for_cdn().post(
                 upload_full_url,
                 data=ciphertext,
                 headers={"Content-Type": "application/octet-stream"},
                 timeout=timeout,
             ) as response:
                 response.raise_for_status()
-                encrypted_query_param = response.headers.get("x-encrypted-param") or filekey
+                # Use CDN response header x-encrypted-param (per official plugin & Go SDK)
+                encrypted_query_param = response.headers.get("x-encrypted-param", "") or url_encrypted_query_param or filekey
         else:
             raise RuntimeError(f"getUploadUrl returned neither upload_param nor upload_full_url: {upload_response}")
 
         context_token = self._token_store.get(self._account_id, chat_id)
         media_item = item_builder(
             encrypt_query_param=encrypted_query_param,
-            aes_key_b64=base64.b64encode(aes_key).decode("ascii"),
+            aes_key_b64=base64.b64encode(aes_key.hex().encode()).decode("ascii"),
             ciphertext_size=len(ciphertext),
             plaintext_size=rawsize,
             filename=Path(path).name,
@@ -1574,24 +1610,31 @@ class WeixinAdapter(BasePlatformAdapter):
             )
 
         last_message_id = f"hermes-weixin-{uuid.uuid4().hex}"
-        await _api_post(
+        payload = {
+            "msg": {
+                "from_user_id": "",
+                "to_user_id": chat_id,
+                "client_id": last_message_id,
+                "message_type": MSG_TYPE_BOT,
+                "message_state": MSG_STATE_FINISH,
+                "item_list": [media_item],
+                **({"context_token": context_token} if context_token else {}),
+            }
+        }
+        print(f"[DEBUG] send_image payload: {json.dumps(payload, default=str, ensure_ascii=False)[:800]}", flush=True)
+        api_result = await _api_post(
             self._session,
             base_url=self._base_url,
             endpoint=EP_SEND_MESSAGE,
-            payload={
-                "msg": {
-                    "from_user_id": "",
-                    "to_user_id": chat_id,
-                    "client_id": last_message_id,
-                    "message_type": MSG_TYPE_BOT,
-                    "message_state": MSG_STATE_FINISH,
-                    "item_list": [media_item],
-                    **({"context_token": context_token} if context_token else {}),
-                }
-            },
+            payload=payload,
             token=self._token,
             timeout_ms=API_TIMEOUT_MS,
         )
+        print(f"[DEBUG] send_image api_result: {json.dumps(api_result, default=str, ensure_ascii=False)}", flush=True)
+        ret = api_result.get("ret", 0)
+        if ret not in (0, None):
+            errmsg = api_result.get("errmsg", "unknown error")
+            raise RuntimeError(f"sendMessage API returned ret={ret}: {errmsg}")
         return last_message_id
 
     def _outbound_media_builder(self, path: str):
@@ -1679,10 +1722,20 @@ async def send_weixin_direct(
                     "account_id": account_id,
                     "base_url": base_url,
                     "cdn_base_url": cdn_base_url,
+                    "cdn_proxy": os.getenv("WEIXIN_CDN_PROXY", ""),
                 },
             )
         )
         adapter._session = session
+        adapter._cdn_session = None
+        cdn_proxy = os.getenv("WEIXIN_CDN_PROXY", "")
+        if cdn_proxy:
+            try:
+                from aiohttp_socks import ProxyConnector
+                connector = ProxyConnector.from_url(cdn_proxy, rdns=True)
+                adapter._cdn_session = aiohttp.ClientSession(connector=connector)
+            except Exception:
+                pass
         adapter._token = resolved_token
         adapter._account_id = account_id
         adapter._base_url = base_url
@@ -1705,6 +1758,8 @@ async def send_weixin_direct(
             if not last_result.success:
                 return {"error": f"Weixin media send failed: {last_result.error}"}
 
+        if adapter._cdn_session and not adapter._cdn_session.closed:
+            await adapter._cdn_session.close()
         return {
             "success": True,
             "platform": "weixin",

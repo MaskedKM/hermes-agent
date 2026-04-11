@@ -938,9 +938,26 @@ class PalaceMemoryProvider(MemoryProvider):
         wing, room = self._classify_content(content, target)
 
         try:
+            if action == "replace" and old_text:
+                # Find and update the matching drawer in Palace
+                matches = self._store.search_fts(old_text, limit=5)
+                if matches:
+                    best = matches[0]
+                    self._store.delete_drawer(best["id"])
+                    self._store.add_drawer(
+                        content=content,
+                        wing=wing,
+                        room=room,
+                        importance=best.get("importance", 4.0),
+                        memory_type="builtin_mirror",
+                        source_type="builtin_mirror",
+                    )
+                    logger.debug("Palace mirror replaced drawer %d via old_text", best["id"])
+                    return
+
             # Use check_duplicate to avoid duplicates with sync_turn/on_session_end
-            existing = self._store.check_duplicate(content)
-            if existing:
+            dup = self._store.check_duplicate(content)
+            if dup:
                 logger.debug("Palace mirror skipped (duplicate): %s...", content[:60])
                 return
 

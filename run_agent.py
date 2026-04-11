@@ -80,7 +80,7 @@ from agent.retry_utils import jittered_backoff
 from agent.error_classifier import classify_api_error, FailoverReason
 from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY, PLATFORM_HINTS,
-    MEMORY_GUIDANCE, SESSION_SEARCH_GUIDANCE, SKILLS_GUIDANCE,
+    MEMORY_TRIAD_GUIDANCE, MEMORY_GUIDANCE, SESSION_SEARCH_GUIDANCE, SKILLS_GUIDANCE,
     build_nous_subscription_prompt,
 )
 from agent.model_metadata import (
@@ -3060,6 +3060,7 @@ class AIAgent:
         # Tool-aware behavioral guidance: only inject when the tools are loaded
         tool_guidance = []
         if "memory" in self.valid_tool_names:
+            tool_guidance.append(MEMORY_TRIAD_GUIDANCE)
             tool_guidance.append(MEMORY_GUIDANCE)
         if "session_search" in self.valid_tool_names:
             tool_guidance.append(SESSION_SEARCH_GUIDANCE)
@@ -6668,6 +6669,7 @@ class AIAgent:
                         function_args.get("action", ""),
                         target,
                         function_args.get("content", ""),
+                        old_text=function_args.get("old_text", ""),
                     )
                 except Exception:
                     pass

@@ -141,6 +141,36 @@ DEFAULT_AGENT_IDENTITY = (
     "Be targeted and efficient in your exploration and investigations."
 )
 
+MEMORY_TRIAD_GUIDANCE = (
+    "You have a three-tier memory system. Each tier has a distinct role:\n\n"
+    "1. MEMORY (always-on, in system prompt): Behavioral compass + minimal context anchor. "
+    "Stores: user preferences, behavioral rules ([RULE]), temporary workarounds (@until), "
+    "Palace index lines ([INDEX] with embedded key info), environment anchors ([ENV]), "
+    "and active project context ([ACTIVE]). "
+    "NEVER store detailed configs (>150 chars), long procedures, or environment facts here.\n\n"
+    "2. MEMORY PALACE (tools: palace_store/recall): Authoritative knowledge base — "
+    "all persistent factual knowledge lives here and ONLY here. "
+    "Use palace_store to save configs, decisions, solutions, discoveries. "
+    "Use palace_recall to search when you need factual details.\n\n"
+    "3. SESSION SEARCH (tool: session_search): Episodic recall — past conversation transcripts. "
+    "Use when the user references past discussions. "
+    "After finding relevant sessions, cross-reference with palace_recall for structured knowledge.\n\n"
+    "RECALL STRATEGY (in order):\n"
+    "- Check Memory snapshot (zero cost, already in context)\n"
+    "- Index lines in Memory contain key info — use that first before calling palace_recall\n"
+    "- Need MORE details than what the index line provides? → palace_recall\n"
+    "- Need past conversation context? → session_search\n"
+    "- User says '上次/之前/last time'? → session_search directly, then cross-reference Palace\n\n"
+    "WRITE STRATEGY:\n"
+    "- User preference/correction → memory(target=user) AND palace_store(wing=user) (dual write)\n"
+    "- Behavioral rule → memory with [RULE] tag (Palace skip)\n"
+    "- Environment config/technical fact → palace_store (appropriate wing/room) "
+    "+ memory [INDEX] line with key info embedded\n"
+    "- Temporary workaround → memory with [WORKAROUND] tag + @until (no Palace)\n"
+    "- Long content (>150 chars) → Palace only, memory [INDEX] summary line\n"
+    "- Do NOT duplicate full content in both Memory and Palace"
+)
+
 MEMORY_GUIDANCE = (
     "You have persistent memory across sessions. Save durable facts using the memory "
     "tool: user preferences, environment details, tool quirks, and stable conventions. "
@@ -152,13 +182,15 @@ MEMORY_GUIDANCE = (
     "Do NOT save task progress, session outcomes, completed-work logs, or temporary TODO "
     "state to memory; use session_search to recall those from past transcripts. "
     "If you've discovered a new way to do something, solved a problem that could be "
-    "necessary later, save it as a skill with the skill tool."
+    "necessary later, save it as a skill with the skill tool.\n"
+    "See MEMORY_TRIAD_GUIDANCE above for the full three-tier recall and write strategy."
 )
 
 SESSION_SEARCH_GUIDANCE = (
     "When the user references something from a past conversation or you suspect "
     "relevant cross-session context exists, use session_search to recall it before "
-    "asking them to repeat themselves."
+    "asking them to repeat themselves. "
+    "After finding relevant sessions, cross-reference with palace_recall for structured knowledge."
 )
 
 SKILLS_GUIDANCE = (
