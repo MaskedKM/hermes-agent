@@ -21,7 +21,7 @@ import json
 import logging
 import re
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List
 
 from agent.memory_provider import MemoryProvider
 from tools.registry import tool_error
@@ -225,6 +225,7 @@ class PalaceMemoryProvider(MemoryProvider):
         self._hermes_home: str | None = None
         self._agent_context: str = "primary"
         self._extract_queue: ExtractionQueue | None = None
+        self._write_memory: Callable[[str, str], None] | None = None  # injected by memory_manager
 
     # -- Core lifecycle -------------------------------------------------------
 
@@ -389,6 +390,89 @@ class PalaceMemoryProvider(MemoryProvider):
 
     # -- Sync turn (auto-extract) ---------------------------------------------
 
+    # -- Reverse index: Palace → Memory --------------------------------------
+
+    def _sync_index_to_memory(
+        self,
+        content: str,
+        wing: str,
+        room: str,
+        importance: float,
+        source_type: str,
+    ) -> None:
+        """Write an INDEX line to Memory for high-importance auto-extracted drawers.
+
+        Only triggers when importance >= 4.0 and source_type is auto_extract
+        or session_extract. Requires _write_memory callback to be injected.
+        """
+        if self._write_memory is None:
+            return
+        if importance < 4.0:
+            return
+        if source_type not in ("auto_extract", "session_extract"):
+            return
+
+        # Generate keywords from wing, room, and first words of content
+        keywords = set()
+        keywords.add(wing)
+        keywords.add(room)
+        # Add first 2 meaningful words from content
+        words = [w for w in content.split()[:6] if len(w) > 2]
+        keywords.update(words[:2])
+
+        snippet = content[:40].replace("\n", " ")
+        kw_str = ", ".join(sorted(keywords)[:4])
+        index_line = f"[INDEX] {snippet} (Palace {wing}/{room}, 搜索: {kw_str})"
+
+        try:
+            self._write_memory("memory", index_line)
+            logger.debug("Palace → Memory INDEX: %s", snippet)
+        except Exception as e:
+            logger.debug("Palace reverse index write failed: %s", e)
+
+    def _refine_session_to_memory_rules(
+        self, memories: List[Dict[str, Any]]
+    ) -> None:
+        """Distill high-importance session memories into Memory [RULE] or [INDEX].
+
+        Called at the end of on_session_end(). Uses the _write_memory callback
+        injected by MemoryManager (Phase 1).
+
+        Rules:
+        - preference + importance >= 4.0 → [RULE] line in Memory
+        - decision + importance >= 4.5 → [INDEX] line in Memory
+        - All other types → skip (already handled by _sync_index_to_memory)
+        """
+        if self._write_memory is None:
+            return
+
+        for mem in memories:
+            mtype = mem.get("memory_type", "general")
+            conf = mem.get("confidence", 0.4)
+            importance = min(5.0, round(conf * 5, 1))
+            content = mem.get("content", "")
+
+            if not content or not content.strip():
+                continue
+
+            if mtype == "preference" and importance >= 4.0:
+                snippet = content[:60].replace("\n", " ")
+                rule_line = f"[RULE] {snippet}"
+                try:
+                    self._write_memory("memory", rule_line)
+                    logger.debug("Session → Memory RULE: %s", snippet)
+                except Exception as e:
+                    logger.debug("Session rule write failed: %s", e)
+
+            elif mtype == "decision" and importance >= 4.5:
+                snippet = content[:60].replace("\n", " ")
+                index_line = f"[INDEX] {snippet} (Palace decisions/architecture)"
+                try:
+                    self._write_memory("memory", index_line)
+                    logger.debug("Session → Memory INDEX: %s", snippet)
+                except Exception as e:
+                    logger.debug("Session index write failed: %s", e)
+
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
         if not self._config.get("auto_extract", True):
             return
@@ -434,6 +518,11 @@ class PalaceMemoryProvider(MemoryProvider):
                 )
                 stored_ids.append(drawer_id)
                 stored += 1
+                # Sync high-importance auto drawers back to Memory INDEX
+                self._sync_index_to_memory(
+                    content=mem["content"], wing=wing, room=room,
+                    importance=importance, source_type="auto_extract",
+                )
             except Exception as e:
                 logger.debug("Palace sync_turn store failed: %s", e)
 
@@ -843,8 +932,16 @@ class PalaceMemoryProvider(MemoryProvider):
                 )
                 new_drawer_ids.append(drawer_id)
                 stored += 1
+                # Sync high-importance session drawers back to Memory INDEX
+                self._sync_index_to_memory(
+                    content=mem["content"], wing=wing, room=room,
+                    importance=importance, source_type="session_extract",
+                )
             except Exception as e:
                 logger.debug("Palace session_end store failed: %s", e)
+
+        # Phase 2: Distill high-importance preferences/decisions into Memory rules
+        self._refine_session_to_memory_rules(memories)
 
         # Build cross-references: link new drawers to semantically related existing ones
         for did in new_drawer_ids:

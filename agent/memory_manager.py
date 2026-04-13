@@ -31,7 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
 from tools.registry import tool_error
@@ -80,6 +80,7 @@ class MemoryManager:
         self._providers: List[MemoryProvider] = []
         self._tool_to_provider: Dict[str, MemoryProvider] = {}
         self._has_external: bool = False  # True once a non-builtin provider is added
+        self._builtin_write_fn: Callable[[str, str], None] | None = None
 
     # -- Registration --------------------------------------------------------
 
@@ -109,6 +110,13 @@ class MemoryManager:
 
         self._providers.append(provider)
 
+        # Inject _write_memory callback for reverse-index capable providers
+        if (
+            self._builtin_write_fn is not None
+            and hasattr(provider, "_write_memory")
+        ):
+            provider._write_memory = self._builtin_write_fn  # type: ignore[attr-defined]
+
         # Index tool names → provider for routing
         for schema in provider.get_tool_schemas():
             tool_name = schema.get("name", "")
@@ -133,6 +141,18 @@ class MemoryManager:
     def providers(self) -> List[MemoryProvider]:
         """All registered providers in order."""
         return list(self._providers)
+
+    def set_builtin_write_fn(self, fn: Callable[[str, str], None]) -> None:
+        """Set the callback for writing to builtin Memory (MEMORY.md).
+
+        This is injected into providers that support reverse-indexing
+        (Palace → Memory). Called by run_agent.py after MemoryStore init.
+        """
+        self._builtin_write_fn = fn
+        # Also inject into already-registered providers
+        for provider in self._providers:
+            if hasattr(provider, "_write_memory"):
+                provider._write_memory = fn  # type: ignore[attr-defined]
 
     def get_provider(self, name: str) -> Optional[MemoryProvider]:
         """Get a provider by name, or None if not registered."""

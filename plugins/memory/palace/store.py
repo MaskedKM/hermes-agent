@@ -609,13 +609,21 @@ class PalaceStore:
         """Generate the L1 Essential Story from the highest-importance drawers.
 
         Groups by room, truncates snippets, and respects a character budget.
+        Ranking uses importance * confidence boosted by recall frequency.
         """
         rows = self.conn.execute(
             """
-            SELECT content, wing, room, importance, confidence, source_file
-            FROM drawers
-            WHERE archived = 0
-            ORDER BY (importance * confidence) DESC
+            SELECT d.content, d.wing, d.room, d.importance, d.confidence,
+                   d.source_file, COALESCE(re.recall_count, 0) AS recall_count
+            FROM drawers d
+            LEFT JOIN (
+                SELECT drawer_id, COUNT(*) AS recall_count
+                FROM recall_events
+                GROUP BY drawer_id
+            ) re ON re.drawer_id = d.id
+            WHERE d.archived = 0
+            ORDER BY (d.importance * d.confidence
+                      * (1.0 + LN(1.0 + COALESCE(re.recall_count, 0)) * 0.3)) DESC
             LIMIT ?
             """,
             (n * 3,),  # over-fetch so grouping has enough material

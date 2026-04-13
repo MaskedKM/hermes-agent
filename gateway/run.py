@@ -1339,7 +1339,16 @@ class GatewayRunner:
                 pass
             try:
                 if hasattr(agent, "shutdown_memory_provider"):
-                    agent.shutdown_memory_provider()
+                    # Pass session messages so palace on_session_end
+                    # can extract memories and build drawer_links.
+                    _sid = getattr(agent, "session_id", None)
+                    _msgs = []
+                    if _sid:
+                        try:
+                            _msgs = self.session_store.load_transcript(_sid) or []
+                        except Exception:
+                            pass
+                    agent.shutdown_memory_provider(messages=_msgs)
             except Exception:
                 pass
             # Close tool resources (terminal sandboxes, browser daemons,
@@ -1682,7 +1691,15 @@ class GatewayRunner:
                         if _cached_agent and _cached_agent is not _AGENT_PENDING_SENTINEL:
                             try:
                                 if hasattr(_cached_agent, 'shutdown_memory_provider'):
-                                    _cached_agent.shutdown_memory_provider()
+                                    # Pass session messages so palace on_session_end
+                                    # can extract memories and build drawer_links.
+                                    _sid = getattr(_cached_agent, 'session_id', None) or entry.session_id
+                                    _msgs = []
+                                    try:
+                                        _msgs = self.session_store.load_transcript(_sid) or []
+                                    except Exception:
+                                        pass
+                                    _cached_agent.shutdown_memory_provider(messages=_msgs)
                             except Exception:
                                 pass
                             try:

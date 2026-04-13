@@ -1192,6 +1192,13 @@ class AIAgent:
                         except Exception:
                             pass
                         self._memory_manager.initialize_all(**_init_kwargs)
+                        # Inject reverse-index callback: Palace → Memory
+                        if self._memory_store is not None:
+                            self._memory_manager.set_builtin_write_fn(
+                                lambda target, content: self._memory_store.add(
+                                    target, content
+                                )
+                            )
                         logger.info("Memory provider '%s' activated", _mem_provider_name)
                     else:
                         logger.debug("Memory provider '%s' not found or not available", _mem_provider_name)
