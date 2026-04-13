@@ -156,10 +156,17 @@ def _to_openai_base_url(base_url: str) -> str:
     completions.  The auxiliary client uses the OpenAI SDK, so it must hit the
     ``/v1`` surface.  Passing the raw ``inference_base_url`` causes requests to
     land on ``/anthropic/chat/completions`` — a 404.
+
+    Z.AI / Zhipu (bigmodel.cn) uses ``/api/paas/v4`` for its OpenAI-compatible
+    endpoint, not ``/v1``.
     """
     url = str(base_url or "").strip().rstrip("/")
     if url.endswith("/anthropic"):
-        rewritten = url[: -len("/anthropic")] + "/v1"
+        # Z.AI: /api/anthropic → /api/paas/v4 (OpenAI-compatible)
+        if "bigmodel.cn" in url:
+            rewritten = url[: -len("/anthropic")] + "/paas/v4"
+        else:
+            rewritten = url[: -len("/anthropic")] + "/v1"
         logger.debug("Auxiliary client: rewrote base URL %s → %s", url, rewritten)
         return rewritten
     return url
