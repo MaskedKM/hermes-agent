@@ -123,8 +123,24 @@ def get_available_skills() -> Dict[str, List[str]]:
 _UPDATE_CHECK_CACHE_SECONDS = 6 * 3600
 
 
+def _has_upstream_remote(repo_dir: Path) -> bool:
+    """Check if an 'upstream' remote is configured."""
+    try:
+        result = subprocess.run(
+            ["git", "remote", "get-url", "upstream"],
+            capture_output=True, text=True, timeout=5,
+            cwd=str(repo_dir),
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
 def check_for_updates() -> Optional[int]:
-    """Check how many commits behind origin/main the local repo is.
+    """Check how many commits behind the upstream the local repo is.
+
+    For fork setups (upstream remote exists), checks HEAD..upstream/main.
+    For official installs, checks HEAD..origin/main as before.
 
     Does a ``git fetch`` at most once every 6 hours (cached to
     ``~/.hermes/.update_check``).  Returns the number of commits behind,
@@ -151,19 +167,31 @@ def check_for_updates() -> Optional[int]:
         pass
 
     # Fetch latest refs (fast — only downloads ref metadata, no files)
+    # Fetch both origin and upstream (if configured) so fork users see
+    # upstream updates even when their fork is up to date.
+    remotes_to_fetch = ["origin"]
+    if _has_upstream_remote(repo_dir):
+        remotes_to_fetch.append("upstream")
     try:
-        subprocess.run(
-            ["git", "fetch", "origin", "--quiet"],
-            capture_output=True, timeout=10,
-            cwd=str(repo_dir),
-        )
+        for remote in remotes_to_fetch:
+            subprocess.run(
+                ["git", "fetch", remote, "--quiet"],
+                capture_output=True, timeout=10,
+                cwd=str(repo_dir),
+            )
     except Exception:
         pass  # Offline or timeout — use stale refs, that's fine
+
+    # Determine which remote to check against
+    if _has_upstream_remote(repo_dir):
+        ref = "upstream/main"
+    else:
+        ref = "origin/main"
 
     # Count commits behind
     try:
         result = subprocess.run(
-            ["git", "rev-list", "--count", "HEAD..origin/main"],
+            ["git", "rev-list", "--count", f"HEAD..{ref}"],
             capture_output=True, text=True, timeout=5,
             cwd=str(repo_dir),
         )

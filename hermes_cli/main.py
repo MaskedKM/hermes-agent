@@ -3467,36 +3467,57 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
         print("  ✗ Could not compare branches. Skipping upstream sync.")
         return
 
-    # If origin/main has commits not on upstream, don't trample
+    # If origin/main has commits not on upstream, try a merge (not ff-only)
+    # so custom commits are preserved while still bringing in upstream changes.
     if origin_ahead > 0:
+        if upstream_ahead == 0:
+            print("  ✓ Fork is up to date with upstream")
+            return
         print()
         print(f"ℹ Your fork has {origin_ahead} commit(s) not on upstream.")
-        print("  Skipping upstream sync to preserve your changes.")
-        print("  If you want to merge upstream changes, run:")
-        print("    git pull upstream main")
-        return
-
-    # If upstream is not ahead, fork is up to date
-    if upstream_ahead == 0:
+        print(f"→ Upstream is {upstream_ahead} commit(s) ahead — merging...")
+        try:
+            merge_result = subprocess.run(
+                git_cmd + ["merge", "upstream/main", "--no-edit"],
+                cwd=cwd, capture_output=True, text=True,
+            )
+            if merge_result.returncode == 0:
+                print("  ✓ Merged upstream into local")
+            else:
+                # Check if it's just conflicts
+                stderr = merge_result.stderr.strip()
+                if "CONFLICT" in (stderr + merge_result.stdout):
+                    print("  ⚠ Merge conflicts detected. Aborting merge.")
+                    print("  Resolve manually:")
+                    print("    git merge --abort")
+                    print("    git merge upstream/main")
+                    subprocess.run(
+                        git_cmd + ["merge", "--abort"],
+                        cwd=cwd, capture_output=True, text=True,
+                    )
+                else:
+                    print(f"  ✗ Merge failed: {stderr or merge_result.stdout.strip()}")
+                return
+        except Exception as e:
+            print(f"  ✗ Merge failed: {e}")
+            return
+    elif upstream_ahead == 0:
         print("  ✓ Fork is up to date with upstream")
         return
-
-    # origin/main is strictly behind upstream/main (can fast-forward)
-    print()
-    print(f"→ Fork is {upstream_ahead} commit(s) behind upstream")
-    print("→ Pulling from upstream...")
-
-    try:
-        subprocess.run(
-            git_cmd + ["pull", "--ff-only", "upstream", "main"],
-            cwd=cwd,
-            check=True,
-        )
-    except subprocess.CalledProcessError:
-        print("  ✗ Failed to pull from upstream. You may need to resolve conflicts manually.")
-        return
-
-    print("  ✓ Updated from upstream")
+    else:
+        # origin/main is strictly behind upstream/main (can fast-forward)
+        print()
+        print(f"→ Fork is {upstream_ahead} commit(s) behind upstream")
+        print("→ Pulling from upstream...")
+        try:
+            subprocess.run(
+                git_cmd + ["pull", "--ff-only", "upstream", "main"],
+                check=True,
+            )
+        except subprocess.CalledProcessError:
+            print("  ✗ Failed to pull from upstream. You may need to resolve conflicts manually.")
+            return
+        print("  ✓ Updated from upstream")
 
     # Try to sync fork back to origin
     print("→ Syncing fork...")
