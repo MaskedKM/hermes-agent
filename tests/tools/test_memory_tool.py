@@ -98,7 +98,6 @@ class TestScanMemoryContent:
 @pytest.fixture()
 def store(tmp_path, monkeypatch):
     """Create a MemoryStore with temp storage."""
-    monkeypatch.setattr("tools.memory_tool.MEMORY_DIR", tmp_path)
     monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
     s = MemoryStore(memory_char_limit=500, user_char_limit=300)
     s.load_from_disk()
@@ -192,7 +191,6 @@ class TestMemoryStoreRemove:
 
 class TestMemoryStorePersistence:
     def test_save_and_load_roundtrip(self, tmp_path, monkeypatch):
-        monkeypatch.setattr("tools.memory_tool.MEMORY_DIR", tmp_path)
         monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
 
         store1 = MemoryStore()
@@ -206,7 +204,6 @@ class TestMemoryStorePersistence:
         assert any("Alice, developer" in e for e in store2.user_entries)
 
     def test_deduplication_on_load(self, tmp_path, monkeypatch):
-        monkeypatch.setattr("tools.memory_tool.MEMORY_DIR", tmp_path)
         monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
         # Write file with duplicates
         mem_file = tmp_path / "MEMORY.md"
