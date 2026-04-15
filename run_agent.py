@@ -7586,7 +7586,25 @@ class AIAgent:
         if num_tools_seq > 0:
             enforce_turn_budget(messages[-num_tools_seq:], env=get_active_env(effective_task_id))
 
+    def _get_remaining_context_budget(self, messages: list) -> int | None:
+        """Estimate remaining context budget in chars (tokens * 4).
 
+        Returns None if the context_compressor is not available or
+        context_length is not set, in which case the caller should
+        fall back to static thresholds.
+        """
+        try:
+            ctx_len = self.context_compressor.context_length
+            if not ctx_len or ctx_len <= 0:
+                return None
+            used_tokens = estimate_messages_tokens_rough(messages)
+            remaining_tokens = ctx_len - used_tokens
+            # Reserve 10% tail budget for the assistant response
+            tail_tokens = int(ctx_len * 0.10)
+            usable_tokens = max(remaining_tokens - tail_tokens, 0)
+            return usable_tokens * 4  # rough chars estimate
+        except Exception:
+            return None
 
     def _emit_context_pressure(self, compaction_progress: float, compressor) -> None:
         """Notify the user that context is approaching the compaction threshold.
