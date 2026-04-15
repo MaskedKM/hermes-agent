@@ -408,7 +408,7 @@ async def _send_message(
         message["item_list"] = [{"type": ITEM_TEXT, "text_item": {"text": text}}]
     if context_token:
         message["context_token"] = context_token
-    await _api_post(
+    resp = await _api_post(
         session,
         base_url=base_url,
         endpoint=EP_SEND_MESSAGE,
@@ -416,6 +416,12 @@ async def _send_message(
         token=token,
         timeout_ms=API_TIMEOUT_MS,
     )
+    # iLink API may return HTTP 200 with an empty body {} or a business
+    # error (ret != 0).  Treat both as send failure so callers can react.
+    if not resp or resp.get("ret"):
+        raise RuntimeError(
+            f"iLink send returned unexpected response: {json.dumps(resp, ensure_ascii=False)[:200]}"
+        )
 
 
 async def _send_typing(
