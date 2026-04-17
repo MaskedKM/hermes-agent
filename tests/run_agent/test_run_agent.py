@@ -138,6 +138,26 @@ def test_aiagent_reuses_existing_errors_log_handler():
             root_logger.addHandler(handler)
 
 
+def test_aiagent_exposes_loaded_config_for_runtime_lookups():
+    """Regression: AIAgent must always set self.config for run_conversation access."""
+    cfg = {"agent": {"api_max_retries": 5}, "auxiliary": {"compression": {"context_length": 8192}}}
+    with (
+        patch("hermes_cli.config.load_config", return_value=cfg),
+        patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        agent = AIAgent(
+            api_key="test-k...7890",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+    assert hasattr(agent, "config")
+    assert agent.config.get("agent", {}).get("api_max_retries") == 5
+
+
 class TestProviderModelNormalization:
     def test_aiagent_strips_matching_native_provider_prefix(self):
         with (

@@ -1129,6 +1129,10 @@ class AIAgent:
         except Exception:
             _agent_cfg = {}
 
+        # Keep a copy of loaded config on the instance for runtime lookups
+        # (e.g. api_max_retries, auxiliary.compression context overrides).
+        self.config = _agent_cfg if isinstance(_agent_cfg, dict) else {}
+
         # Persistent memory (MEMORY.md + USER.md) -- loaded from disk
         self._memory_store = None
         self._memory_enabled = False
@@ -8332,7 +8336,7 @@ class AIAgent:
             
             api_start_time = time.time()
             retry_count = 0
-            max_retries = 3
+            max_retries = (self.config or {}).get("agent", {}).get("api_max_retries", 3)
             primary_recovery_attempted = False
             max_compression_attempts = 3
             codex_auth_retry_attempted=False

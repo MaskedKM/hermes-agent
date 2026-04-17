@@ -420,9 +420,15 @@ async def _send_message(
         token=token,
         timeout_ms=API_TIMEOUT_MS,
     )
-    # iLink API may return HTTP 200 with an empty body {} or a business
-    # error (ret != 0).  Treat both as send failure so callers can react.
-    if not resp or resp.get("ret"):
+    # iLink text send may return HTTP 200 with `{}` on success (same behavior
+    # observed in send_document). Only treat explicit business errors as failure.
+    if not isinstance(resp, dict):
+        raise RuntimeError(
+            f"iLink send returned non-dict response: {json.dumps(resp, ensure_ascii=False)[:200]}"
+        )
+    ret = resp.get("ret")
+    errcode = resp.get("errcode")
+    if ret not in (0, None) or errcode not in (0, None):
         raise RuntimeError(
             f"iLink send returned unexpected response: {json.dumps(resp, ensure_ascii=False)[:200]}"
         )
@@ -1067,6 +1073,7 @@ class WeixinAdapter(BasePlatformAdapter):
         self._token_store = ContextTokenStore(hermes_home)
         self._typing_cache = TypingTicketCache()
         self._session: Optional[aiohttp.ClientSession] = None
+        self._cdn_session: Optional[aiohttp.ClientSession] = None
         self._poll_task: Optional[asyncio.Task] = None
         self._dedup = MessageDeduplicator(ttl_seconds=MESSAGE_DEDUP_TTL_SECONDS)
 

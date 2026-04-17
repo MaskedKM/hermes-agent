@@ -221,6 +221,7 @@ class PalaceStore:
             "ALTER TABLE drawers ADD COLUMN confidence REAL DEFAULT 0.5",
             "ALTER TABLE drawers ADD COLUMN archived INTEGER DEFAULT 0",
             "ALTER TABLE drawers ADD COLUMN source_session_id TEXT DEFAULT NULL",
+            "ALTER TABLE drawers ADD COLUMN feedback_weight REAL DEFAULT 0.5",
         ]:
             try:
                 self.conn.execute(col_sql)
@@ -301,6 +302,24 @@ class PalaceStore:
             );
             CREATE INDEX IF NOT EXISTS idx_dreaming_signals_drawer ON dreaming_signals(drawer_id);
             CREATE INDEX IF NOT EXISTS idx_dreaming_signals_phase ON dreaming_signals(phase);
+
+            -- Feedback loop: feedback events
+            CREATE TABLE IF NOT EXISTS feedback_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                drawer_id TEXT NOT NULL,
+                session_id TEXT NOT NULL DEFAULT '',
+                feedback_type TEXT NOT NULL CHECK(feedback_type IN (
+                    'correction',
+                    'affirmation',
+                    'implicit_negative'
+                )),
+                signal_strength REAL NOT NULL DEFAULT 0.0,
+                context TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                FOREIGN KEY (drawer_id) REFERENCES drawers(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_feedback_drawer ON feedback_events(drawer_id);
+            CREATE INDEX IF NOT EXISTS idx_feedback_time ON feedback_events(created_at);
 
             -- Dreaming: run logs
             CREATE TABLE IF NOT EXISTS dreaming_runs (
@@ -469,6 +488,34 @@ class PalaceStore:
         if deleted:
             logger.debug("delete_drawer %s (links cleaned)", drawer_id)
         return deleted
+
+    def batch_update_drawers(self, updates: list[dict]) -> int:
+        """Batch-update drawer fields.  Each *update* must contain ``id``
+        plus the columns to change (e.g. ``importance``)."""
+        if not updates:
+            return 0
+        count = 0
+        for u in updates:
+            did = u.pop("id", None)
+            if not did or not u:
+                continue
+            set_clause = ", ".join(f"{k} = ?" for k in u)
+            vals = list(u.values()) + [did]
+            cur = self.conn.execute(
+                f"UPDATE drawers SET {set_clause} WHERE id = ?", vals
+            )
+            count += cur.rowcount
+        if count:
+            self.conn.commit()
+        return count
+
+    def set_feedback_weight(self, drawer_id: str, weight: float) -> None:
+        """Persist the feedback EMA weight for a drawer."""
+        self.conn.execute(
+            "UPDATE drawers SET feedback_weight = ? WHERE id = ?",
+            (weight, drawer_id),
+        )
+        self.conn.commit()
 
     def list_drawers(
         self,
@@ -1244,4 +1291,200 @@ class PalaceStore:
         result = {"light": 0, "deep": 0, "rem": 0}
         for r in rows:
             result[r["phase"]] = r["cnt"]
-        return result
+
+    # ------------------------------------------------------------------
+    # 增强三: Hybrid Search (FTS5 + Vector RRF)
+    # ------------------------------------------------------------------
+
+    def search_hybrid(
+        self,
+        query: str,
+        wing: str | None = None,
+        room: str | None = None,
+        limit: int = 5,
+        mode: str = "auto",
+        vector_store=None,
+    ) -> List[Dict[str, Any]]:
+        """Hybrid search: FTS5 BM25 + vector kNN with RRF fusion.
+
+        Args:
+            query: Search query string.
+            wing: Optional wing filter.
+            room: Optional room filter.
+            limit: Max results to return.
+            mode: "auto" | "fts" | "vector" | "hybrid".
+                auto: hybrid if vector_store available and has embeddings,
+                      else fts fallback.
+                fts: pure FTS5 (same as search_fts).
+                vector: pure vector kNN (debug).
+                hybrid: always try both, merge with RRF.
+            vector_store: Optional VectorStore instance for vector search.
+
+        Returns:
+            List of drawer dicts, sorted by RRF score descending.
+        """
+        # Validate mode
+        mode = mode.lower()
+        if mode not in ("auto", "fts", "vector", "hybrid"):
+            mode = "auto"
+
+        # Determine effective mode
+        if mode == "auto":
+            if vector_store is None or vector_store.get_embedding_count() == 0:
+                mode = "fts"
+            else:
+                mode = "hybrid"
+
+        # Pure FTS mode
+        if mode == "fts":
+            return self.search_fts_with_links(query, wing=wing, room=room, limit=limit)
+
+        # Pure vector mode (debug)
+        if mode == "vector":
+            if vector_store is None:
+                return []
+            return self._search_vector_only(query, vector_store, limit=limit)
+
+        # Hybrid mode: FTS5 + Vector kNN → RRF fusion
+        return self._search_rrf(query, wing=wing, room=room, limit=limit,
+                                vector_store=vector_store)
+
+    def _search_vector_only(
+        self,
+        query: str,
+        vector_store,
+        limit: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """Pure vector search — for debugging."""
+        if not vector_store._client.available:
+            return []
+
+        try:
+            q_emb = vector_store._client.embed_text(query[:500])
+        except Exception as e:
+            logger.warning("Vector search: embedding failed: %s", e)
+            return []
+
+        vec_results = vector_store.search_vectors(q_emb, k=limit)
+        results = []
+        for vr in vec_results:
+            drawer = self.get_drawer(vr["drawer_id"])
+            if drawer:
+                drawer["_vec_distance"] = vr["distance"]
+                results.append(drawer)
+        return results
+
+    def _search_rrf(
+        self,
+        query: str,
+        wing: str | None,
+        room: str | None,
+        limit: int,
+        vector_store,
+        k: int = 60,
+        fetch_k: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """RRF fusion of FTS5 and vector search results.
+
+        RRF formula: score(d) = w_fts / (k + fts_rank) + w_vec / (k + vec_rank)
+        where ranks start at 1.
+        """
+        # Phase 1: FTS5 BM25 (fetch more than limit for RRF)
+        fts_results = self.search_fts(query, wing=wing, room=room, limit=fetch_k)
+        fts_rank_map: Dict[str, int] = {}
+        for i, r in enumerate(fts_results):
+            fts_rank_map[r["id"]] = i + 1  # rank from 1
+
+        # Phase 2: Vector kNN
+        vec_rank_map: Dict[str, int] = {}
+        vec_dist_map: Dict[str, float] = {}
+        if vector_store and vector_store._client.available:
+            try:
+                q_emb = vector_store._client.embed_text(query[:500])
+                vec_results = vector_store.search_vectors(q_emb, k=fetch_k)
+                for i, vr in enumerate(vec_results):
+                    vec_rank_map[vr["drawer_id"]] = i + 1
+                    vec_dist_map[vr["drawer_id"]] = vr["distance"]
+            except Exception as e:
+                logger.warning("RRF vector search failed (fts-only fallback): %s", e)
+
+        # Phase 3: Merge with RRF
+        all_ids = set(fts_rank_map.keys()) | set(vec_rank_map.keys())
+        scored: List[Tuple[str, float]] = []
+        for did in all_ids:
+            score = 0.0
+            if did in fts_rank_map:
+                score += 1.0 / (k + fts_rank_map[did])
+            if did in vec_rank_map:
+                score += 1.0 / (k + vec_rank_map[did])
+            scored.append((did, score))
+
+        # Sort by RRF score descending
+        scored.sort(key=lambda x: x[1], reverse=True)
+
+        # Fetch full drawer dicts for top results
+        results: List[Dict[str, Any]] = []
+        for did, score in scored[:limit]:
+            drawer = self.get_drawer(did)
+            if drawer:
+                drawer["_rrf_score"] = round(score, 6)
+                if did in fts_rank_map:
+                    drawer["_fts_rank"] = fts_rank_map[did]
+                if did in vec_rank_map:
+                    drawer["_vec_rank"] = vec_rank_map[did]
+                    drawer["_vec_distance"] = vec_dist_map[did]
+                results.append(drawer)
+
+        # Phase 4: Link expansion if we have room
+        if len(results) < limit:
+            seen_ids = {r["id"] for r in results}
+            id_list = list(seen_ids)
+            ph = ",".join("?" for _ in id_list)
+            linked_rows = self.conn.execute(
+                f"""
+                SELECT DISTINCT
+                    CASE WHEN dl.source_id IN ({ph}) THEN dl.target_id
+                         ELSE dl.source_id END AS linked_id
+                FROM drawer_links dl
+                WHERE dl.source_id IN ({ph}) OR dl.target_id IN ({ph})
+                """,
+                id_list + id_list + id_list,
+            ).fetchall()
+
+            remaining = limit - len(results)
+            for row in linked_rows:
+                if remaining <= 0:
+                    break
+                lid = row["linked_id"]
+                if lid in seen_ids:
+                    continue
+                seen_ids.add(lid)
+                drawer = self.get_drawer(lid)
+                if drawer:
+                    drawer["_rrf_score"] = 0.0
+                    results.append(drawer)
+                    remaining -= 1
+
+        return results
+
+    def get_feedback_weight(self, drawer_id: str) -> float:
+        """Get feedback_weight for a drawer. Returns 0.5 (neutral) if column missing."""
+        try:
+            row = self.conn.execute(
+                "SELECT feedback_weight FROM drawers WHERE id = ?",
+                (drawer_id,),
+            ).fetchone()
+            return row["feedback_weight"] if row else 0.5
+        except Exception:
+            return 0.5  # Column may not exist yet (Phase 2 not applied)
+
+    def set_feedback_weight(self, drawer_id: str, weight: float) -> None:
+        """Set feedback_weight for a drawer. No-op if column doesn't exist."""
+        try:
+            self.conn.execute(
+                "UPDATE drawers SET feedback_weight = ? WHERE id = ?",
+                (weight, drawer_id),
+            )
+            self.conn.commit()
+        except Exception as e:
+            logger.debug("set_feedback_weight failed (column may not exist): %s", e)

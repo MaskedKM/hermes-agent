@@ -49,6 +49,21 @@ EXTRACTION_SYSTEM_PROMPT = """\
 
 **排除**：常见停用词（的、了、是、the、is 等），过短的词（<2字符）
 
+## 反馈信号检测（Feedback Signal）
+
+同时判断对话中是否包含用户对 AI 回答的反馈，以及反馈针对的记忆内容。
+
+- **positive**: 用户肯定、感谢、确认 AI 回答正确
+- **negative**: 用户纠正、否定、指出 AI 回答错误
+- **null**: 无明显反馈信号（普通提问、指令等）
+
+如果检测到反馈，还需识别反馈针对的具体记忆主题（用简短关键词描述），以便精确定位需要调整的记忆。
+
+**示例：**
+- "对的，就是这样" → positive, ["PostgreSQL"]
+- "你说错了，我用的是 MySQL 不是 PostgreSQL" → negative, ["PostgreSQL", "MySQL"]
+- "帮我查一下天气" → null
+
 ## 输出格式
 
 严格返回 JSON 对象，不要包含任何其他文字：
@@ -62,14 +77,22 @@ EXTRACTION_SYSTEM_PROMPT = """\
       "confidence": 0.8
     }
   ],
-  "entities": ["实体A", "实体B", "实体C"]
+  "entities": ["实体A", "实体B", "实体C"],
+  "feedback": {
+    "signal": "positive|negative|null",
+    "strength": 0.5,
+    "targets": ["反馈针对的主题关键词A", "关键词B"]
+  }
 }
 ```
 
 - memories: 记忆数组，如果没有则返回空数组
 - entities: 实体列表（小写），如果没有则返回空数组
+- feedback.signal: 反馈类型，无反馈时为 null
+- feedback.strength: 信号强度 0.0-1.0，表示反馈的确定程度
+- feedback.targets: 反馈针对的记忆主题关键词列表，用于定位相关记忆
 - confidence: 0.0-1.0，表示这条信息的确定性和重要性
-- 如果没有任何值得提取的信息，返回 `{"memories": [], "entities": []}`\
+- 如果没有任何值得提取的信息且无反馈，返回 `{"memories": [], "entities": [], "feedback": {"signal": null, "strength": 0, "targets": []}}`\
 """
 
 EXTRACTION_USER_TEMPLATE = """\
@@ -126,19 +149,20 @@ def _parse_json_response(text: str) -> Any:
     return None
 
 
-def _parse_extraction_response(text: str) -> tuple[Optional[List[Dict[str, Any]]], List[str]]:
-    """Parse LLM response into (memories, entities).
+def _parse_extraction_response(text: str) -> tuple[Optional[List[Dict[str, Any]]], List[str], Optional[Dict[str, Any]]]:
+    """Parse LLM response into (memories, entities, feedback).
 
-    Supports both new format ({"memories": [...], "entities": [...]})
+    Supports both new format ({"memories": [...], "entities": [...], "feedback": {...}})
     and legacy format ([...]) for backward compatibility.
     """
     parsed = _parse_json_response(text)
     if parsed is None:
-        return None, []
+        return None, [], None
 
     entities: List[str] = []
+    feedback: Optional[Dict[str, Any]] = None
 
-    # New format: {"memories": [...], "entities": [...]}
+    # New format: {"memories": [...], "entities": [...], "feedback": {...}}
     if isinstance(parsed, dict):
         memories = parsed.get("memories", [])
         raw_entities = parsed.get("entities", [])
@@ -148,13 +172,32 @@ def _parse_extraction_response(text: str) -> tuple[Optional[List[Dict[str, Any]]
                 for e in raw_entities
                 if e and str(e).strip() and len(str(e).strip()) >= 2
             ]
-        return memories if isinstance(memories, list) else None, entities
+        # Parse feedback field (Cognee-style)
+        raw_feedback = parsed.get("feedback")
+        if isinstance(raw_feedback, dict):
+            signal = raw_feedback.get("signal")
+            if signal and signal.lower() in ("positive", "negative"):
+                try:
+                    strength = float(raw_feedback.get("strength", 0.5))
+                except (TypeError, ValueError):
+                    strength = 0.5
+                strength = max(0.0, min(1.0, strength))
+                targets = raw_feedback.get("targets", [])
+                if not isinstance(targets, list):
+                    targets = []
+                targets = [str(t).strip() for t in targets if t and str(t).strip()]
+                feedback = {
+                    "signal": signal.lower(),
+                    "strength": strength,
+                    "targets": targets,
+                }
+        return memories if isinstance(memories, list) else None, entities, feedback
 
     # Legacy format: [...]  (bare array)
     if isinstance(parsed, list):
-        return parsed, []
+        return parsed, [], None
 
-    return None, []
+    return None, [], None
 
 
 # ---------------------------------------------------------------------------
@@ -229,8 +272,8 @@ def extract_memories_llm(
     *,
     min_confidence: float = 0.3,
     max_chars: int = 6000,
-) -> tuple[List[Dict[str, Any]], List[str]]:
-    """Extract memories and entities using LLM.
+) -> tuple[List[Dict[str, Any]], List[str], Optional[Dict[str, Any]]]:
+    """Extract memories, entities, and feedback using LLM.
 
     Args:
         text: Conversation text to extract from.
@@ -238,9 +281,10 @@ def extract_memories_llm(
         max_chars: Max characters to send to LLM.
 
     Returns:
-        Tuple of (memories, entities).
+        Tuple of (memories, entities, feedback).
         - memories: List of memory dicts with keys: content, memory_type, confidence, source.
         - entities: List of entity strings extracted from the text.
+        - feedback: Dict with signal/strength/targets, or None.
 
     Raises:
         RuntimeError: If no LLM provider is available.
@@ -268,17 +312,17 @@ def extract_memories_llm(
         raise  # No provider — let caller fall back to regex
     except Exception as e:
         logger.warning("LLM memory extraction failed: %s", e)
-        return [], []
+        return [], [], None
 
     if not raw_content.strip():
-        return [], []
+        return [], [], None
 
-    raw_memories, entities = _parse_extraction_response(raw_content)
+    raw_memories, entities, feedback = _parse_extraction_response(raw_content)
     if raw_memories is None:
         logger.debug("LLM memory extraction returned non-JSON: %s", raw_content[:200])
-        return [], []
+        return [], [], None
 
-    return _normalize_memories(raw_memories, min_confidence), entities
+    return _normalize_memories(raw_memories, min_confidence), entities, feedback
 
 
 def extract_memories_with_fallback(
@@ -286,8 +330,8 @@ def extract_memories_with_fallback(
     *,
     min_confidence: float = 0.3,
     prefer_llm: bool = True,
-) -> tuple[List[Dict[str, Any]], List[str]]:
-    """Extract memories and entities using LLM, falling back to regex.
+) -> tuple[List[Dict[str, Any]], List[str], Optional[Dict[str, Any]]]:
+    """Extract memories, entities, and feedback using LLM, falling back to regex.
 
     Args:
         text: Conversation text.
@@ -295,28 +339,29 @@ def extract_memories_with_fallback(
         prefer_llm: If True, try LLM first then regex fallback.
 
     Returns:
-        Tuple of (memories, entities).
-        When LLM is used, entities come from LLM extraction.
-        When regex fallback is used, entities come from regex extract_entities.
+        Tuple of (memories, entities, feedback).
+        When LLM is used, entities and feedback come from LLM extraction.
+        When regex fallback is used, entities come from regex, feedback is None.
     """
+    feedback = None
     if prefer_llm:
         try:
-            llm_memories, llm_entities = extract_memories_llm(
+            llm_memories, llm_entities, llm_feedback = extract_memories_llm(
                 text, min_confidence=min_confidence
             )
             if llm_memories:
                 logger.debug("LLM extracted %d memories, %d entities", len(llm_memories), len(llm_entities))
-                return llm_memories, llm_entities
-            # LLM returned no memories but might have entities — still return them
-            if llm_entities:
-                return [], llm_entities
+                return llm_memories, llm_entities, llm_feedback
+            # LLM returned no memories but might have entities or feedback
+            if llm_entities or llm_feedback:
+                return [], llm_entities, llm_feedback
         except RuntimeError:
             logger.debug("No LLM provider for memory extraction, using regex fallback")
         except Exception as e:
             logger.warning("LLM extraction error, falling back to regex: %s", e)
 
-    # Regex fallback — extract entities via regex
+    # Regex fallback — extract entities via regex, no feedback detection
     from .extractor import extract_memories, extract_entities
     memories = extract_memories(text, min_confidence=min_confidence)
     entities = extract_entities(text)
-    return memories, entities
+    return memories, entities, None

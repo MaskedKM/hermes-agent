@@ -344,6 +344,9 @@ DEFAULT_CONFIG = {
         # Sends a status message every N seconds so the user knows the
         # agent hasn't died during long tasks.  0 = disable notifications.
         "gateway_notify_interval": 600,
+        # Max retries for API errors (rate limits, server errors, etc.)
+        # before falling back to fallback providers or giving up.
+        "api_max_retries": 3,
     },
     
     "terminal": {

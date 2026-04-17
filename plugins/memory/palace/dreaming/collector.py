@@ -48,6 +48,8 @@ class RecallCandidate:
     # Phase signals
     light_signals: int = 0
     rem_signals: int = 0
+    # Feedback signal (from user corrections/affirmations)
+    feedback_weight: float = 0.5  # 0.5=neutral, 0.0=strong negative, 1.0=strong positive
 
 
 @dataclass
@@ -91,6 +93,12 @@ class RecallCollector:
             # Get dreaming signal counts
             signal_counts = self.store.get_dreaming_signal_counts(d["id"])
 
+            # Get feedback weight
+            try:
+                feedback_weight = self.store.get_feedback_weight(d["id"])
+            except Exception:
+                feedback_weight = 0.5
+
             candidate = RecallCandidate(
                 drawer_id=d["id"],
                 content=d["content"],
@@ -109,6 +117,7 @@ class RecallCollector:
                 source_session_id=d.get("source_session_id"),
                 light_signals=signal_counts.get("light", 0),
                 rem_signals=signal_counts.get("rem", 0),
+                feedback_weight=feedback_weight,
             )
             candidates.append(candidate)
 

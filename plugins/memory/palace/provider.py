@@ -29,7 +29,7 @@ from .store import PalaceStore
 from .extractor import extract_memories as _extract_memories_regex
 from .extractor import extract_entities as _extract_entities
 from .llm_extractor import extract_memories_with_fallback
-from .queue import ExtractionQueue, detect_correction
+from .queue import ExtractionQueue, detect_correction, detect_feedback_signal
 from .knowledge_graph import PalaceKnowledgeGraph
 from .miner import mine_project, mine_sessions, mine_status
 
@@ -259,6 +259,49 @@ class PalaceMemoryProvider(MemoryProvider):
         self._store = PalaceStore(db_path)
         self._kg = PalaceKnowledgeGraph(kg_path)
 
+        # Vector store (Phase 1: hybrid search)
+        self._vector_store = None
+        emb_config = self._config.get("embedding") or {}
+        if emb_config.get("enabled", True):
+            # Derive API key from zai/vision config if not explicitly set
+            if not emb_config.get("api_key"):
+                # Try to get from auxiliary.vision or providers.zai config (same Zhipu API)
+                try:
+                    from hermes_constants import get_hermes_home
+                    import yaml
+                    cfg_path = get_hermes_home() / "config.yaml"
+                    with open(cfg_path) as f:
+                        full = yaml.safe_load(f) or {}
+                    for path in (("auxiliary", "vision"), ("providers", "zai")):
+                        section = full
+                        for key in path:
+                            section = section.get(key, {}) if isinstance(section, dict) else {}
+                        api_key = section.get("api_key") if isinstance(section, dict) else None
+                        if api_key:
+                            emb_config["api_key"] = api_key
+                            break
+                except Exception:
+                    pass
+            if emb_config.get("api_key"):
+                try:
+                    from .embedding_client import EmbeddingClient
+                    from .vector_store import VectorStore
+                    client = EmbeddingClient(emb_config)
+                    dim = int(emb_config.get("dimension", 2048))
+                    self._vector_store = VectorStore(
+                        conn=self._store.conn,
+                        embedding_client=client,
+                        dimension=dim,
+                    )
+                    emb_count = self._vector_store.get_embedding_count()
+                    logger.info("VectorStore initialized (dim=%d, embeddings=%d)",
+                                dim, emb_count)
+                except Exception as e:
+                    logger.warning("VectorStore init failed (fts-only mode): %s", e)
+                    self._vector_store = None
+            else:
+                logger.info("No embedding API key configured — hybrid search disabled")
+
         # Debounce queue for LLM extraction
         extract_mode = self._config.get("extract_mode", "regex")
         debounce_seconds = float(self._config.get("debounce_seconds", 30))
@@ -331,8 +374,10 @@ class PalaceMemoryProvider(MemoryProvider):
         if not self._store or not query or not query.strip():
             return ""
         try:
-            # Phase 1: FTS5 search + link expansion
-            results = self._store.search_fts_with_links(query.strip(), limit=5)
+            # Use hybrid search (FTS5 + vector RRF) if vector store available
+            results = self._store.search_hybrid(
+                query.strip(), limit=5, vector_store=self._vector_store
+            )
             if not results:
                 return ""
             lines = ["## Memory Palace"]
@@ -506,6 +551,21 @@ class PalaceMemoryProvider(MemoryProvider):
             if has_correction and mtype in ("decision", "fact", "preference"):
                 importance = min(5.0, importance + 1.0)
                 raw_conf = min(1.0, raw_conf + 0.2)
+            # Semantic dedup check: skip near-duplicate content
+            try:
+                from .semantic_dedup import SemanticDeduplicator as SD
+                if self._vector_store and self._embedding_client:
+                    sd = SD(vector_store=self._vector_store)
+                    dup = sd.find_duplicate(
+                        mem["content"],
+                        embed_fn=self._embedding_client.embed_text,
+                    )
+                    if dup.is_duplicate:
+                        logger.debug("Semantic dedup: skipping duplicate (sim=%.2f, match=%s)",
+                                     dup.similarity, dup.best_match_id)
+                        continue
+            except Exception as e:
+                logger.debug("Semantic dedup check failed: %s", e)
             try:
                 drawer_id = self._store.add_drawer(
                     content=mem["content"],
@@ -538,6 +598,20 @@ class PalaceMemoryProvider(MemoryProvider):
         except Exception as e:
             logger.debug("Palace sync_turn co-occurrence failed: %s", e)
 
+        # --- Feedback pre-check: keyword-based fast path ----------------------
+        # LLM-based feedback detection happens in debounced extraction.
+        # Keyword pre-check serves as fallback when LLM is unavailable.
+        keyword_feedback = detect_feedback_signal(user_content)
+        # Only apply keyword feedback immediately if no LLM queue configured
+        if keyword_feedback is not None and self._extract_queue is None:
+            try:
+                from .feedback import FeedbackReactor
+                reactor = FeedbackReactor(self._store)
+                reactor.apply_feedback(keyword_feedback, relevant_drawer_ids=stored_ids or None)
+                logger.debug("Palace keyword feedback applied (no LLM queue): %.2f", keyword_feedback)
+            except Exception as e:
+                logger.debug("Palace keyword feedback reactor failed: %s", e)
+
         if stored:
             logger.info("Palace auto-extracted %d memories from turn (regex)", stored)
 
@@ -550,6 +624,7 @@ class PalaceMemoryProvider(MemoryProvider):
                     filtered,
                     min_confidence=min_conf,
                     has_correction=has_correction,
+                    keyword_feedback=keyword_feedback,
                 )
 
     @staticmethod
@@ -589,12 +664,18 @@ class PalaceMemoryProvider(MemoryProvider):
         memories: list,
         entities: list,
         has_correction: bool,
+        feedback: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Store LLM-extracted memories from the debounce queue."""
+        """Store LLM-extracted memories from the debounce queue.
+
+        Also applies Cognee-style feedback reactor: if feedback signal is
+        detected, adjust importance of targeted (or recent) drawers.
+        """
         if not self._store:
             return
 
         min_conf = float(self._config.get("min_confidence", 0.3))
+        stored_ids: list[str] = []
         stored = 0
         for mem in memories:
             mtype = mem.get("memory_type", mem.get("type", "fact"))
@@ -611,7 +692,7 @@ class PalaceMemoryProvider(MemoryProvider):
                 existing = self._store.check_duplicate(mem["content"])
                 if existing:
                     continue
-                self._store.add_drawer(
+                did = self._store.add_drawer(
                     content=mem["content"],
                     wing=wing,
                     room=room,
@@ -620,6 +701,7 @@ class PalaceMemoryProvider(MemoryProvider):
                     memory_type=mtype,
                     source_type="auto_extract_llm",
                 )
+                stored_ids.append(did)
                 stored += 1
             except Exception as e:
                 logger.debug("Palace debounced store failed: %s", e)
@@ -635,8 +717,58 @@ class PalaceMemoryProvider(MemoryProvider):
             except Exception:
                 pass
 
+        # --- Cognee-style feedback reactor ---
+        if feedback and feedback.get("signal") in ("positive", "negative"):
+            try:
+                from .feedback import FeedbackReactor
+                signal = feedback["signal"]
+                strength = feedback.get("strength", 0.5)
+                targets = feedback.get("targets", [])
+                # Convert to signed strength
+                signed = strength if signal == "positive" else -strength
+                # Resolve target drawer IDs (Cognee: used_graph_element_ids)
+                relevant_ids = self._resolve_feedback_targets(targets, stored_ids)
+                reactor = FeedbackReactor(self._store)
+                n = reactor.apply_feedback(signed, relevant_drawer_ids=relevant_ids)
+                logger.info(
+                    "Palace feedback reactor: signal=%s strength=%.2f targets=%s adjusted=%d drawers",
+                    signal, strength, targets, n,
+                )
+            except Exception as e:
+                logger.debug("Palace debounced feedback reactor failed: %s", e)
+
         if stored:
             logger.info("Palace debounced LLM extraction: %d memories stored", stored)
+
+    def _resolve_feedback_targets(
+        self,
+        targets: list[str],
+        fallback_ids: list[str],
+    ) -> Optional[list[str]]:
+        """Resolve feedback targets to drawer IDs.
+
+        Cognee-style: if LLM identified specific topics, search drawers
+        by those keywords.  Otherwise fall back to recently stored IDs.
+
+        Returns list of drawer IDs or None (let reactor pick recent).
+        """
+        if not targets:
+            return fallback_ids or None
+
+        try:
+            matched_ids = []
+            for keyword in targets:
+                results = self._store.search_fts(keyword, limit=3)
+                for r in results:
+                    did = r.get("id") if isinstance(r, dict) else None
+                    if did and did not in matched_ids:
+                        matched_ids.append(did)
+            if matched_ids:
+                return matched_ids
+        except Exception as e:
+            logger.debug("Feedback target resolution failed: %s", e)
+
+        return fallback_ids or None
 
     # -- Tools ----------------------------------------------------------------
 
@@ -733,11 +865,12 @@ class PalaceMemoryProvider(MemoryProvider):
                 query = args.get("query", "")
                 if not query:
                     return tool_error("'query' is required for search action")
-                results = store.search_fts(
+                results = store.search_hybrid(
                     query,
                     wing=args.get("wing"),
                     room=args.get("room"),
                     limit=int(args.get("limit", 5)),
+                    vector_store=self._vector_store,
                 )
                 return json.dumps({"results": results, "count": len(results)})
 

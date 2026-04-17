@@ -11,6 +11,7 @@ from gateway.platforms.base import (
     safe_url_for_log,
     utf16_len,
     _prefix_within_utf16_limit,
+    _strip_internal_context_blocks,
 )
 
 
@@ -44,6 +45,26 @@ class TestSafeUrlForLog:
         assert safe_url_for_log(url, max_len=3) == "..."
         assert safe_url_for_log(url, max_len=2) == ".."
         assert safe_url_for_log(url, max_len=0) == ""
+
+
+class TestStripInternalContextBlocks:
+    def test_strips_memory_context_block(self):
+        text = (
+            "<memory-context>\n"
+            "[System note: The following is recalled memory context]\n"
+            "secret\n"
+            "</memory-context>\n\n"
+            "Visible reply"
+        )
+        assert _strip_internal_context_blocks(text) == "Visible reply"
+
+    def test_strips_supermemory_context_block(self):
+        text = "A\n<supermemory-context>debug context</supermemory-context>\nB"
+        assert _strip_internal_context_blocks(text) == "A\nB"
+
+    def test_returns_placeholder_when_only_context(self):
+        text = "<memory-context>hidden</memory-context>"
+        assert _strip_internal_context_blocks(text) == "[internal context omitted]"
 
 
 # ---------------------------------------------------------------------------

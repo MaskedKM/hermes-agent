@@ -17,10 +17,11 @@ STEADY_STATE_WEIGHTS = {
     "recall_relevance": 0.25,
     "recall_frequency": 0.20,
     "recall_diversity": 0.12,
-    "intrinsic_quality": 0.15,
+    "intrinsic_quality": 0.13,
+    "feedback_adjustment": 0.05,
     "recency": 0.13,
-    "connectivity": 0.08,
-    "time_consolidation": 0.07,
+    "connectivity": 0.07,
+    "time_consolidation": 0.05,
 }
 
 # ─── Light Sleep ───

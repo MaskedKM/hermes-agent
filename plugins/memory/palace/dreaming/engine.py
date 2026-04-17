@@ -21,6 +21,7 @@ from plugins.memory.palace.dreaming.defaults import (
     LIGHT_MIN_HOURS_BETWEEN_RUNS,
     RECALL_EVENTS_MAX_AGE_DAYS,
 )
+from plugins.memory.palace.semantic_dedup import SemanticDeduplicator
 
 logger = logging.getLogger(__name__)
 
@@ -28,11 +29,14 @@ logger = logging.getLogger(__name__)
 class DreamingEngine:
     """Orchestrates Dreaming memory consolidation phases."""
 
-    def __init__(self, store, session_db=None) -> None:
+    def __init__(self, store, session_db=None, vector_store=None) -> None:
         self.store = store
         self.session_db = session_db
         self.collector = RecallCollector(store)
         self.deduplicator = Deduplicator()
+        self.semantic_deduplicator = SemanticDeduplicator(
+            vector_store=vector_store, fallback=self.deduplicator,
+        )
         self.scorer = DreamingScorer(store)
         self.promoter = PromotionEngine(store)
         self.recovery = DreamingRecovery(store, session_db)
@@ -79,8 +83,13 @@ class DreamingEngine:
             )
             report["drawers_processed"] = len(items)
 
-            # 2. Deduplicate
-            groups = self.deduplicator.dedupe(items, threshold=LIGHT_DEDUP_THRESHOLD)
+            # 2. Deduplicate (semantic when available, else Jaccard)
+            embed_fn = None
+            if self.semantic_deduplicator.available and hasattr(self.store, '_embedding_client'):
+                embed_fn = self.store._embedding_client.embed_texts
+            groups = self.semantic_deduplicator.dedupe(
+                items, threshold=LIGHT_DEDUP_THRESHOLD, embed_fn=embed_fn,
+            )
 
             # 3. Consolidate
             consolidation = self.promoter.run_light_consolidation(groups)

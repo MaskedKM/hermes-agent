@@ -141,11 +141,18 @@ class DreamingScorer:
         # Phase boost
         phase_boost = self._phase_boost(c.light_signals, c.rem_signals)
 
+        # Feedback adjustment: how user feedback has shaped this memory
+        # feedback_weight is in [0, 1], centered at 0.5 (neutral)
+        feedback_adjustment = abs(c.feedback_weight - 0.5) * 2.0  # 0=neutral, 1=extreme
+        if c.feedback_weight < 0.5:
+            feedback_adjustment = -feedback_adjustment  # Negative feedback
+
         total = (
             w["recall_relevance"] * recall_relevance
             + w["recall_frequency"] * recall_frequency
             + w["recall_diversity"] * recall_diversity
             + w["intrinsic_quality"] * intrinsic
+            + w["feedback_adjustment"] * feedback_adjustment
             + w["recency"] * recency
             + w["connectivity"] * connectivity
             + w["time_consolidation"] * time_consolidation
@@ -163,6 +170,7 @@ class DreamingScorer:
                 "recall_frequency": round(recall_frequency, 4),
                 "recall_diversity": round(recall_diversity, 4),
                 "intrinsic_quality": round(intrinsic, 4),
+                "feedback_adjustment": round(feedback_adjustment, 4),
                 "recency": round(recency, 4),
                 "connectivity": round(connectivity, 4),
                 "time_consolidation": round(time_consolidation, 4),

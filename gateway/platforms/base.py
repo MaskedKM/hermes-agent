@@ -20,6 +20,25 @@ from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
 
+_MEMORY_CONTEXT_BLOCK_RE = re.compile(
+    r"<(?:memory-context|supermemory-context)>[\s\S]*?</(?:memory-context|supermemory-context)>\s*",
+    re.IGNORECASE,
+)
+_MEMORY_CONTEXT_TAG_RE = re.compile(
+    r"</?\s*(?:memory-context|supermemory-context)\s*>",
+    re.IGNORECASE,
+)
+
+
+def _strip_internal_context_blocks(text: str) -> str:
+    """Strip internal memory-context fences from model output before delivery."""
+    if not text:
+        return text
+    cleaned = _MEMORY_CONTEXT_BLOCK_RE.sub("", text)
+    cleaned = _MEMORY_CONTEXT_TAG_RE.sub("", cleaned)
+    cleaned = cleaned.strip()
+    return cleaned or "[internal context omitted]"
+
 
 def utf16_len(s: str) -> int:
     """Count UTF-16 code units in *s*.
@@ -1399,9 +1418,11 @@ class BasePlatformAdapter(ABC):
         know to retry rather than waiting indefinitely.
         """
 
+        outgoing_content = _strip_internal_context_blocks(content)
+
         result = await self.send(
             chat_id=chat_id,
-            content=content,
+            content=outgoing_content,
             reply_to=reply_to,
             metadata=metadata,
         )
@@ -1428,7 +1449,7 @@ class BasePlatformAdapter(ABC):
                 await asyncio.sleep(delay)
                 result = await self.send(
                     chat_id=chat_id,
-                    content=content,
+                    content=outgoing_content,
                     reply_to=reply_to,
                     metadata=metadata,
                 )
@@ -1451,11 +1472,11 @@ class BasePlatformAdapter(ABC):
                     logger.debug("[%s] Could not send delivery-failure notice: %s", self.name, notify_err)
                 return result
 
-        # Non-network / post-retry formatting failure: try plain text as fallback
+        # Non-network / post-retry failure: try plain text as fallback
         logger.warning("[%s] Send failed: %s — trying plain-text fallback", self.name, error_str)
         fallback_result = await self.send(
             chat_id=chat_id,
-            content=f"(Response formatting failed, plain text:)\n\n{content[:3500]}",
+            content=f"(Send failed, plain text fallback:)\n\n{outgoing_content[:3500]}",
             reply_to=reply_to,
             metadata=metadata,
         )
